@@ -27,7 +27,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 try:
-    from playwright.sync_api import sync_playwright, TimeoutError as _PWTimeout
+    from playwright.sync_api import sync_playwright, TimeoutError as _PWTimeout, Error as PlaywrightError
     _PLAYWRIGHT_OK = True
 except ImportError:
     _PLAYWRIGHT_OK = False
@@ -173,8 +173,41 @@ class VirtuNumBrowser:
 
     def _launch_browser(self) -> None:
         """Abre Chrome con el perfil configurado y deja self._page listo."""
+        # Limpiar cualquier loop asyncio existente antes de abrir Playwright
+        try:
+            import asyncio
+            try:
+                loop = asyncio.get_running_loop()
+                # Si hay un loop corriendo, no podemos hacer nada aquí
+                print("VirtuNum: advertencia - hay un asyncio loop activo, intentando nuevo event loop")
+                asyncio.set_event_loop(asyncio.new_event_loop())
+            except RuntimeError:
+                # No hay loop corriendo, verificar si hay un loop configurado
+                try:
+                    loop = asyncio.get_event_loop()
+                    if loop.is_closed():
+                        asyncio.set_event_loop(asyncio.new_event_loop())
+                except RuntimeError:
+                    asyncio.set_event_loop(asyncio.new_event_loop())
+        except Exception:
+            pass
+
         self._pw_mgr = sync_playwright()
-        self._p = self._pw_mgr.start()
+        try:
+            self._p = self._pw_mgr.start()
+        except PlaywrightError as exc:
+            if "using Playwright Sync API inside the asyncio loop" in str(exc):
+                print("VirtuNum: detectado bucle asyncio activo durante start(), reiniciando event loop")
+                self._close()
+                try:
+                    import asyncio
+                    asyncio.set_event_loop(asyncio.new_event_loop())
+                except Exception:
+                    pass
+                self._pw_mgr = sync_playwright()
+                self._p = self._pw_mgr.start()
+            else:
+                raise
 
         user_data_dir, extra_args = self._chrome_profile_launch_args()
         print(f"VirtuNum: usando perfil Chrome {self.profile_dir} -> {user_data_dir} {extra_args}")
@@ -229,7 +262,33 @@ class VirtuNumBrowser:
             self._close()
             raise
 
-    def open_and_get_phone(self) -> str:
+    def _normalize_phone(self, phone: str) -> str:
+        digits = re.sub(r"\D+", "", phone)
+        return f"+{digits}" if digits else phone.strip()
+
+    def _click_buy_next_number(self, page) -> bool:
+        patterns = [
+            r"buy next number",
+            r"buy another number",
+            r"comprar siguiente numero",
+            r"comprar siguiente número",
+            r"compra siguiente",
+            r"next number",
+            r"buy next",
+        ]
+        for pattern in patterns:
+            try:
+                locator = page.get_by_text(re.compile(pattern, re.IGNORECASE))
+                if locator.count() > 0:
+                    print(f"VirtuNum: clic en boton de siguiente numero ({pattern})")
+                    locator.first.click(timeout=5_000)
+                    time.sleep(1.5)
+                    return True
+            except Exception:
+                pass
+        return False
+
+    def open_and_get_phone(self, skip_phones: set[str] | None = None) -> str:
         """Abre el navegador, navega a VirtuNum, compra el numero y lo devuelve.
 
         El navegador permanece abierto para que wait_for_sms pueda esperar el SMS
@@ -248,12 +307,32 @@ class VirtuNumBrowser:
 
             self._select_country(self._page)
 
-            phone = self._read_phone(self._page)
-            if not phone:
-                raise VirtuNumError("No aparecio ningun numero de telefono en VirtuNum")
-            self._current_phone = phone
-            print(f"VirtuNum: numero = {phone}")
-            return phone
+            attempts = 0
+            while True:
+                phone = self._read_phone(self._page)
+                if not phone:
+                    raise VirtuNumError("No aparecio ningun numero de telefono en VirtuNum")
+                phone = self._normalize_phone(phone)
+                if skip_phones and phone in skip_phones:
+                    attempts += 1
+                    if attempts > 5:
+                        raise VirtuNumError(
+                            "No se pudo obtener un numero de VirtuNum diferente a los ya usados"
+                        )
+                    print(f"VirtuNum: numero {phone} ya fue usado. Buscando siguiente numero... ({attempts})")
+                    if self._click_buy_next_number(self._page):
+                        continue
+                    try:
+                        self._page.reload(wait_until="domcontentloaded", timeout=15_000)
+                        time.sleep(1.5)
+                        continue
+                    except Exception:
+                        raise VirtuNumError(
+                            "No se pudo actualizar la pagina de VirtuNum para buscar otro numero"
+                        )
+                self._current_phone = phone
+                print(f"VirtuNum: numero = {phone}")
+                return phone
         except Exception:
             self._close()
             raise
@@ -290,12 +369,39 @@ class VirtuNumBrowser:
             except Exception:
                 pass
             self._ctx = None
+        # Prefer stopping the Playwright instance returned by start()
+        if self._p:
+            try:
+                # The SyncPlaywright object exposes a `stop()` method that delegates
+                # to the context manager exit; call it when available.
+                self._p.stop()
+            except Exception as exc:
+                print(f"VirtuNum: error al detener Playwright (self._p.stop): {exc}")
+
+        # Best-effort cleanup of the context manager object kept in _pw_mgr.
         if self._pw_mgr:
             try:
-                self._pw_mgr.stop()
+                # Historically code called self._pw_mgr.stop(), but the
+                # PlaywrightContextManager object doesn't implement `stop()`.
+                # Only call it if present to avoid AttributeError.
+                if hasattr(self._pw_mgr, "stop"):
+                    self._pw_mgr.stop()
+            except Exception as exc:
+                print(f"VirtuNum: error al cerrar PlaywrightContextManager: {exc}")
+            # Siempre intentar limpiar el asyncio loop, incluso si hay error
+            try:
+                import asyncio
+                try:
+                    loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    loop = asyncio.get_event_loop()
+                if loop and not loop.is_closed():
+                    loop.close()
+                asyncio.set_event_loop(asyncio.new_event_loop())
             except Exception:
                 pass
             self._pw_mgr = None
+
         self._page = None
         self._p = None
 
@@ -419,16 +525,33 @@ class VirtuNumBrowser:
     def _wait_sms(self, page, poll: int = 5) -> str | None:
         """Recarga la pagina y busca el codigo SMS solo en la tarjeta del numero actual."""
         deadline = time.time() + self.sms_timeout
+        start = time.time()
+        # Strategy:
+        # - For the first 2 minutes: poll frequently (default `poll`) without forcing a reload.
+        # - After 2 minutes: increase polling interval and reload the page every iteration (refresh every minute).
         while time.time() < deadline:
             code = self._extract_code_for_current_phone(page)
             if code:
                 return code
+
+            elapsed = time.time() - start
+            # If we've passed 2 minutes, switch to 60s refresh interval
+            if elapsed >= 120:
+                try:
+                    page.reload(wait_until="domcontentloaded", timeout=15_000)
+                    time.sleep(1.5)
+                except Exception:
+                    pass
+                # wait a minute before next refresh (or until deadline)
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    break
+                time.sleep(min(60, remaining))
+                continue
+
+            # First 2 minutes: short sleep rounds, do not force reloads to avoid rate limits
             time.sleep(poll)
-            try:
-                page.reload(wait_until="domcontentloaded", timeout=15_000)
-                time.sleep(1.5)
-            except Exception:
-                pass
+
         return None
 
     def _extract_code_for_current_phone(self, page) -> str | None:
@@ -538,7 +661,7 @@ class VirtuNumClient:
         service: str = "Any other",
         country: str = "England",
         headless: bool = False,
-        sms_timeout: int = 180,
+        sms_timeout: int = 420,
         close_browser_after_sms: bool = False,
     ):
         self._browser = VirtuNumBrowser(
@@ -557,7 +680,7 @@ class VirtuNumClient:
         service = os.environ.get("VIRTUNUM_PRODUCT", "Any other")
         country = os.environ.get("VIRTUNUM_COUNTRY", "England")
         headless = os.environ.get("VIRTUNUM_HEADLESS", "0").strip() in ("1", "true", "yes")
-        sms_timeout = int(os.environ.get("VIRTUNUM_SMS_TIMEOUT", "180"))
+        sms_timeout = int(os.environ.get("VIRTUNUM_SMS_TIMEOUT", "420"))
         if os.environ.get("VIRTUNUM_CLOSE_BROWSER", "0").strip() in ("1", "true", "yes"):
             print("VirtuNum: VIRTUNUM_CLOSE_BROWSER ignorado; Chrome se deja abierto para conservar el OTP.")
         close_browser_after_sms = False
@@ -569,7 +692,13 @@ class VirtuNumClient:
             close_browser_after_sms=close_browser_after_sms,
         )
 
-    def buy_activation(self, country: str = "", product: str = "", operator: str = "") -> ActivationOrder:
+    def buy_activation(
+        self,
+        country: str = "",
+        product: str = "",
+        operator: str = "",
+        skip_phones: set[str] | None = None,
+    ) -> ActivationOrder:
         """Abre el navegador, selecciona el servicio y devuelve el numero asignado.
 
         El navegador permanece abierto hasta que se llame a wait_sms_code(), lo que
@@ -580,7 +709,7 @@ class VirtuNumClient:
             print(f"VirtuNum: reutilizando numero indicado por VIRTUNUM_REUSE_PHONE = {reuse_phone}")
             phone = self._browser.open_existing_phone(reuse_phone)
         else:
-            phone = self._browser.open_and_get_phone()
+            phone = self._browser.open_and_get_phone(skip_phones=skip_phones)
         self._pending_phone = phone
         self._pending_code = None
         return ActivationOrder(order_id="browser", phone=phone, status="PENDING")

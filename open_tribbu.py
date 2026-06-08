@@ -4,8 +4,10 @@ import argparse
 import csv
 import html
 import re
+import sqlite3
 import subprocess
 import time
+from datetime import datetime
 from pathlib import Path
 
 import config
@@ -14,6 +16,29 @@ from virtunum_api import VirtuNumClient, VirtuNumError
 
 
 ROOT = Path(__file__).resolve().parent
+
+USED_VIRTUNUM_PHONES_PATH = ROOT / "used_virtunum_numbers.txt"
+USED_VIRTUNUM_OTPS_PATH = ROOT / "used_virtunum_otps.txt"
+USED_PERSONS_DB_PATH = ROOT / "used_persons.db"
+
+# Instancia global de VirtuNumClient que se reutiliza entre llamadas
+# para evitar crear múltiples loops asyncio de Playwright
+_VIRTUNUM_CLIENT: VirtuNumClient | None = None
+
+
+def get_virtunum_client() -> VirtuNumClient | None:
+    """Obtiene o crea la instancia global del cliente VirtuNum.
+    
+    Se reutiliza la misma instancia entre llamadas para evitar conflictos
+    con el loop asyncio de Playwright cuando se procesan múltiples apps.
+    """
+    global _VIRTUNUM_CLIENT
+    if _VIRTUNUM_CLIENT is None:
+        try:
+            _VIRTUNUM_CLIENT = VirtuNumClient.from_env()
+        except VirtuNumError:
+            return None
+    return _VIRTUNUM_CLIENT
 
 
 def adb(*args: str, timeout: int = 15) -> subprocess.CompletedProcess[str]:
@@ -38,6 +63,56 @@ def screen_size() -> tuple[int, int]:
     if match:
         return int(match.group(1)), int(match.group(2))
     return (1200, 1920)
+
+
+def normalize_phone_number(phone: str) -> str:
+    digits = "".join(ch for ch in phone if ch.isdigit())
+    return f"+{digits}" if digits else phone.strip()
+
+
+def load_used_virtunum_numbers() -> set[str]:
+    if not USED_VIRTUNUM_PHONES_PATH.exists():
+        return set()
+    try:
+        text = USED_VIRTUNUM_PHONES_PATH.read_text(encoding="utf-8")
+    except Exception:
+        return set()
+    return {
+        normalize_phone_number(line)
+        for line in text.splitlines()
+        if line.strip()
+    }
+
+
+def save_used_virtunum_number(phone: str) -> None:
+    normalized = normalize_phone_number(phone)
+    if not normalized:
+        return
+    used = load_used_virtunum_numbers()
+    if normalized in used:
+        return
+    try:
+        with USED_VIRTUNUM_PHONES_PATH.open("a", encoding="utf-8") as handle:
+            handle.write(normalized + "\n")
+    except Exception as exc:
+        print(f"No pude guardar numero usado en {USED_VIRTUNUM_PHONES_PATH}: {exc}")
+    else:
+        print(f"Guardado numero usado: {normalized}")
+
+
+def save_used_virtunum_otp(phone: str, otp: str) -> None:
+    normalized_phone = normalize_phone_number(phone)
+    otp_value = otp.strip()
+    if not normalized_phone or not otp_value:
+        return
+    line = f"{normalized_phone} {otp_value}"
+    try:
+        with USED_VIRTUNUM_OTPS_PATH.open("a", encoding="utf-8") as handle:
+            handle.write(line + "\n")
+    except Exception as exc:
+        print(f"No pude guardar OTP usado en {USED_VIRTUNUM_OTPS_PATH}: {exc}")
+    else:
+        print(f"Guardado OTP usado: {line}")
 
 
 def ui_dump_xml() -> str:
@@ -285,20 +360,124 @@ def tap_otp_entry_field(settle: float = 0.4) -> None:
     tap(x, y, settle=settle)
 
 
-def load_person_for_tribbu(tribbu_number: int) -> tuple[str, str, str]:
-    csv_path = ROOT / "lista_personas.csv"
+def init_used_persons_db() -> None:
+    conn = sqlite3.connect(USED_PERSONS_DB_PATH)
+    try:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS assigned_persons (
+                tribbu_number INTEGER PRIMARY KEY,
+                row_index INTEGER NOT NULL,
+                nombre TEXT NOT NULL,
+                apellidos TEXT NOT NULL,
+                dni TEXT NOT NULL,
+                assigned_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def find_person_list_csv() -> Path:
+    candidates = [
+        ROOT / "lista_personas.csv",
+        ROOT.parent / "lista_personas.csv",
+        Path.cwd() / "lista_personas.csv",
+    ]
+    for path in candidates:
+        if path.exists() and path.is_file():
+            return path
+    raise FileNotFoundError(
+        "No se encontro lista_personas.csv. Coloca el archivo en tab-a9-tribbu/ o en la carpeta padre del proyecto."
+    )
+
+
+def load_person_list() -> list[dict[str, str]]:
+    csv_path = find_person_list_csv()
     with csv_path.open("r", encoding="utf-8-sig", newline="") as handle:
         rows = list(csv.DictReader(handle))
-    index = tribbu_number - 1
-    if index < 0 or index >= len(rows):
-        raise RuntimeError(f"No hay persona para TRIBBU {tribbu_number:03d} en {csv_path}")
-    row = rows[index]
-    name = clean_adb_text(row.get("nombre", ""))
-    surname = clean_adb_text(row.get("apellidos", ""))
-    dni = clean_adb_text(row.get("dni", ""))
-    if not name or not surname:
-        raise RuntimeError(f"Fila incompleta para TRIBBU {tribbu_number:03d} en {csv_path}")
-    return name, surname, dni
+    return rows
+
+
+def get_assigned_person_for_tribbu(tribbu_number: int) -> dict[str, str] | None:
+    init_used_persons_db()
+    conn = sqlite3.connect(USED_PERSONS_DB_PATH)
+    try:
+        cursor = conn.execute(
+            "SELECT row_index, nombre, apellidos, dni FROM assigned_persons WHERE tribbu_number = ?",
+            (tribbu_number,),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            return None
+        return {
+            "row_index": str(row[0]),
+            "nombre": row[1],
+            "apellidos": row[2],
+            "dni": row[3],
+        }
+    finally:
+        conn.close()
+
+
+def get_assigned_row_indices() -> set[int]:
+    init_used_persons_db()
+    conn = sqlite3.connect(USED_PERSONS_DB_PATH)
+    try:
+        cursor = conn.execute("SELECT row_index FROM assigned_persons")
+        return {row[0] for row in cursor.fetchall()}
+    finally:
+        conn.close()
+
+
+def assign_person_to_tribbu(tribbu_number: int, row_index: int, nombre: str, apellidos: str, dni: str) -> None:
+    init_used_persons_db()
+    conn = sqlite3.connect(USED_PERSONS_DB_PATH)
+    try:
+        conn.execute(
+            "INSERT OR REPLACE INTO assigned_persons (tribbu_number, row_index, nombre, apellidos, dni, assigned_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                tribbu_number,
+                row_index,
+                nombre,
+                apellidos,
+                dni,
+                datetime.now().isoformat(),
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def load_person_for_tribbu(tribbu_number: int) -> tuple[str, str, str]:
+    assigned = get_assigned_person_for_tribbu(tribbu_number)
+    if assigned is not None:
+        return (
+            clean_adb_text(assigned["nombre"]),
+            clean_adb_text(assigned["apellidos"]),
+            clean_adb_text(assigned["dni"]),
+        )
+
+    rows = load_person_list()
+    used_rows = get_assigned_row_indices()
+    for idx, row in enumerate(rows, start=1):
+        if idx in used_rows:
+            continue
+        name = clean_adb_text(row.get("nombre", ""))
+        surname = clean_adb_text(row.get("apellidos", ""))
+        dni = clean_adb_text(row.get("dni", ""))
+        if not name or not surname or not dni:
+            continue
+        assign_person_to_tribbu(tribbu_number, idx, name, surname, dni)
+        print(f"Asignando persona TRIBBU {tribbu_number:03d} -> fila {idx}")
+        return name, surname, dni
+
+    raise RuntimeError(
+        "No hay filas disponibles sin usar en lista_personas.csv. Actualiza el CSV o limpia used_persons.db."
+    )
 
 
 def wait_for_personal_data_screen(timeout: float = 25.0, poll: float = 1.0) -> bool:
@@ -314,19 +493,108 @@ def wait_for_personal_data_screen(timeout: float = 25.0, poll: float = 1.0) -> b
     return False
 
 
-def tap_first_personal_field(settle: float = 0.4) -> None:
+def get_personal_edit_fields() -> list[dict[str, str | int | bool]]:
     xml = ui_dump_xml()
-    candidates = [
+    fields = [
         node
         for node in _parse_nodes(xml)
-        if "EditText" in str(node.get("class", "")) and int(node["y"]) > 350
+        if "EditText" in str(node.get("class", ""))
     ]
-    if candidates:
-        first = sorted(candidates, key=lambda node: int(node["y"]))[0]
-        tap(int(first["x"]), int(first["y"]), settle=settle)
+    return sorted(fields, key=lambda node: int(node["y"]))
+
+
+def _normalize_field_text(text: str) -> str:
+    return re.sub(r"[^A-Za-z0-9]", "", str(text or "")).lower()
+
+
+def _wait_for_field_text(expected: str, field_index: int = 0, timeout: float = 4.0) -> bool:
+    normalized_expected = _normalize_field_text(expected)
+    if not normalized_expected:
+        return False
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        fields = get_personal_edit_fields()
+        if field_index < len(fields):
+            actual = _normalize_field_text(fields[field_index].get("text", ""))
+            if actual == normalized_expected:
+                return True
+            if normalized_expected.startswith(actual) and len(actual) >= min(3, len(normalized_expected)):
+                return True
+        time.sleep(0.25)
+    return False
+
+
+def tap_first_personal_field(settle: float = 0.4) -> None:
+    fields = get_personal_edit_fields()
+    if fields:
+        tap(int(fields[0]["x"]), int(fields[0]["y"]), settle=settle)
         return
     width, height = screen_size()
     tap(width // 2, int(height * 0.48), settle=settle)
+
+
+def tap_personal_field(index: int, settle: float = 0.4) -> None:
+    fields = get_personal_edit_fields()
+    if not fields:
+        width, height = screen_size()
+        tap(width // 2, int(height * 0.48), settle=settle)
+        return
+    field = fields[index] if index < len(fields) else fields[-1]
+    tap(int(field["x"]), int(field["y"]), settle=settle)
+
+
+def wait_for_dni_screen(timeout: float = 25.0, poll: float = 1.0) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        screen = current_screen_text()
+        if any(token in screen for token in ("dni", "document", "identification", "identificacion", "passport", "passport number", "rut")):
+            return True
+        xml = ui_dump_xml()
+        nodes = _parse_nodes(xml)
+        edit_count = sum(1 for node in nodes if "EditText" in str(node.get("class", "")))
+        if edit_count >= 1:
+            return True
+        time.sleep(poll)
+    return False
+
+
+def tap_dni_input_field(settle: float = 0.4) -> None:
+    fields = get_personal_edit_fields()
+    if not fields:
+        width, height = screen_size()
+        tap(width // 2, int(height * 0.48), settle=settle)
+        return
+
+    # El campo real de DNI suele ser el último campo de entrada o el que está vacío.
+    empty_fields = [field for field in fields if not field.get("text")]
+    if empty_fields:
+        field = empty_fields[-1]
+    else:
+        field = max(fields, key=lambda node: int(node["x2"]) - int(node["x1"]))
+    tap(int(field["x"]), int(field["y"]), settle=settle)
+
+
+def fill_dni_field(dni: str) -> bool:
+    print(f"Escribiendo DNI: {dni}")
+    if not wait_for_dni_screen(timeout=25):
+        print("No se detecto pantalla de DNI; igualmente intento escribir en el campo disponible.")
+
+    for attempt in range(1, 2):
+        tap_dni_input_field(settle=0.4)
+        clear_focused_text(max_chars=30, settle=0.1)
+        type_text_adb(dni, settle=0.5)
+
+        if _wait_for_field_text(dni, field_index=0, timeout=4.0):
+            print("DNI confirmado en el campo de texto.")
+            return True
+
+        print(f"DNI no confirmado tras el intento {attempt}; reintentando...")
+        dismiss_keyboard_if_visible(settle=0.3)
+        time.sleep(0.6)
+
+    time.sleep(0.5)
+    print("No se pudo verificar que el DNI se haya escrito correctamente.")
+    return False
 
 
 def fill_personal_name_fields(name: str, surname: str) -> None:
@@ -334,12 +602,30 @@ def fill_personal_name_fields(name: str, surname: str) -> None:
     if not wait_for_personal_data_screen(timeout=25):
         print("No se detecto pantalla de datos personales; no escribo nombre/apellidos.")
         return
-    tap_first_personal_field(settle=0.4)
+
+    fields = get_personal_edit_fields()
+    if not fields:
+        print("No se detectaron campos de texto para datos personales.")
+        return
+
+    # Campo nombre
+    tap_personal_field(0, settle=0.4)
     clear_focused_text(max_chars=40, settle=0.1)
     type_text_adb(name, settle=0.5)
-    press_keyevent("61", settle=0.8)  # TAB al campo de apellidos
-    clear_focused_text(max_chars=50, settle=0.1)
-    type_text_adb(surname, settle=0.5)
+
+    # Si hay un segundo campo, completar apellido en él.
+    if len(fields) >= 2:
+        tap_personal_field(1, settle=0.4)
+        clear_focused_text(max_chars=50, settle=0.1)
+        type_text_adb(surname, settle=0.5)
+        print("Datos personales escritos: nombre y apellido")
+    else:
+        print("Solo se detecto un campo de texto para datos personales; no se escribe apellido.")
+
+    dismiss_keyboard_if_visible(settle=0.5)
+    time.sleep(0.5)
+    tap_primary_action_button(settle=0.8)
+    # Return control to caller to handle DNI on the next screen.
 
 
 def normalize_phone_for_country(phone: str, country_code: str) -> str:
@@ -529,15 +815,16 @@ def accept_terms_if_present() -> None:
 
 
 def tap_primary_action_button(settle: float = 0.8) -> bool:
+    candidates = ["continue", "continuar", "next", "siguiente", "verify", "verificar", "activate", "activar"]
     if tap_node_text(
-        ["continue", "continuar", "next", "siguiente", "verify", "verificar"],
+        candidates,
         prefer_clickable=False,
         min_y=1400,
         settle=settle,
     ):
         return True
     if tap_node_contains(
-        ["continue", "continuar", "next", "siguiente", "verify", "verificar"],
+        candidates,
         min_y=1400,
         settle=settle,
     ):
@@ -547,6 +834,39 @@ def tap_primary_action_button(settle: float = 0.8) -> bool:
     fallback_y = min(height - 140, 1789)
     print(f"Boton principal no detectado por texto; fallback abajo @ ({fallback_x}, {fallback_y})")
     tap(fallback_x, fallback_y, settle=settle)
+    return True
+
+
+def tap_activate_button(settle: float = 0.8) -> bool:
+    candidates = ["activate", "activar"]
+    if tap_node_text(
+        candidates,
+        prefer_clickable=False,
+        min_y=1400,
+        settle=settle,
+    ):
+        return True
+    if tap_node_contains(
+        candidates,
+        min_y=1400,
+        settle=settle,
+    ):
+        return True
+
+    if keyboard_is_visible():
+        print("Teclado visible; intentando bajar teclado antes de pulsar Activate")
+        dismiss_keyboard_if_visible(settle=0.2)
+        time.sleep(0.4)
+        fallback_coords = [(650, 1151), (665, 1720)]
+    else:
+        fallback_coords = [(665, 1720), (650, 1151)]
+
+    print("Boton Activate no detectado por texto; intentando coordenadas fijas en dos intentos")
+    for idx, (fallback_x, fallback_y) in enumerate(fallback_coords, start=1):
+        print(f"Intento {idx}: Tap Activate en coordenadas @ ({fallback_x}, {fallback_y})")
+        tap(fallback_x, fallback_y, settle=settle)
+        time.sleep(0.4)
+
     return True
 
 
@@ -611,15 +931,15 @@ def wait_for_any_text(candidates: list[str], timeout: float = 18.0, poll: float 
 
 
 def verify_phone_with_virtunum(tribbu_number: int) -> bool:
-    try:
-        client = VirtuNumClient.from_env()
-    except VirtuNumError as exc:
-        print(f"VirtuNum no disponible: {exc}")
+    client = get_virtunum_client()
+    if client is None:
+        print(f"VirtuNum no disponible")
         return False
 
+    used_numbers = load_used_virtunum_numbers()
     try:
         # buy_activation abre el navegador, selecciona el servicio y espera el SMS
-        order = client.buy_activation()
+        order = client.buy_activation(skip_phones=used_numbers)
     except VirtuNumError as exc:
         print(f"Error abriendo VirtuNum en el navegador: {exc}")
         return False
@@ -648,6 +968,7 @@ def verify_phone_with_virtunum(tribbu_number: int) -> bool:
     code, _ = client.wait_sms_code()
     if not code:
         print("No llego OTP de VirtuNum dentro del timeout")
+        save_used_virtunum_number(order.phone)
         return False
 
     print(f"OTP recibido: {code}")
@@ -656,8 +977,20 @@ def verify_phone_with_virtunum(tribbu_number: int) -> bool:
     type_digits_keyevents(code, settle=0.22)
     tap_primary_action_button(settle=0.8)
     time.sleep(4)
-    name, surname, _dni = load_person_for_tribbu(tribbu_number)
+    save_used_virtunum_number(order.phone)
+    save_used_virtunum_otp(order.phone, code)
+    name, surname, dni = load_person_for_tribbu(tribbu_number)
     fill_personal_name_fields(name, surname)
+    # Wait a short period for the UI to transition to the DNI screen,
+    # then write the DNI to avoid overwriting el nombre.
+    time.sleep(7.0)
+    if not fill_dni_field(dni):
+        print("Error: no se pudo escribir el DNI correctamente.")
+        return False
+    dismiss_keyboard_if_visible(settle=0.4)
+    tap_activate_button(settle=0.8)
+    time.sleep(2.0)
+    go_home()
     return True
 
 
@@ -705,6 +1038,7 @@ def select_role(role: str, attempts: int = 3) -> bool:
         "for my trips",
         "para mis viajes",
         "i already have companions",
+        
         "im looking for companions",
         "i'm looking for companions",
     ]
@@ -763,6 +1097,7 @@ def start_registration(tribbu_number: int, verify_phone: bool = False) -> None:
         ok = verify_phone_with_virtunum(tribbu_number)
         if not ok:
             print(f"Fallo Verify your phone number en TRIBBU {tribbu_number:03d}")
+            tap_activate_button(settle=0.8)
             return
         print(f"Verify your phone number completado en TRIBBU {tribbu_number:03d}")
 
